@@ -1,0 +1,14 @@
+.build/
+dist/
+.DS_Store
+*.xcuserstate
+
+# Never commit signing key material. The code-signing cert is per-machine and
+# lives only in the login keychain — recreate it with scripts/setup_signing.sh.
+*.p12
+*.pem
+*.cer
+*.key
+
+# Local-only maintainer notes; not published.
+CLAUDE.md

@@ -1,0 +1,134 @@
+<div align="center">
+
+# SayKey
+
+**按鍵說話，文字就落在游標處。**
+
+一個輕巧的 macOS 選單列語音輸入工具，專為**整天中英混講**的人設計。
+按下快捷鍵、說話、再按一次——你的話就以**繁體中文**出現在游標位置，
+English 技術詞拼寫正確。
+
+100% 本機 · 離線 · 免 API key · 聲音永遠不離開你的 Mac。
+
+</div>
+
+---
+
+## 為什麼是 SayKey？
+
+市面上多數 Mac 語音輸入工具，假設你只說一種語言、而且要連雲端。SayKey 反過來：
+
+- 🗣️ **為中英混講而生** — 說「幫我看一下 CloudWatch 的 p95 latency，然後 rollback 那個 deployment」，它就照寫，English 術語完整保留。
+- 🇹🇼 **一律繁體中文** — Whisper 常吐簡體；SayKey 透過 OpenCC 把每段結果統一轉成台灣繁體（軟體 ≠ 软件、列印 ≠ 打印）。
+- 🔒 **完全本機、隱私** — 用 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) 在裝置上辨識。不串 OpenAI API、不靠 Siri、不連網路，飛航模式也能用。
+- 🧠 **聽得懂你的術語** — 內建 SRE / DevOps 詞庫（kubectl、Terraform、PagerDuty、5xx、p95…），還能自訂專屬的「常錯字」修正表。
+- ⚡ **不擋路** — 一個選單列麥克風圖示、閒置時 ~0% CPU、全域快捷鍵、沒有 Dock 圖示、不用註冊帳號。
+
+## 運作流程
+
+```
+🎙  Control-Option-Space          → 開始錄音（16 kHz 單聲道）
+🎙  再按一次 Control-Option-Space   → 停止
+🧠  whisper.cpp（large-v3-turbo）  → 本機辨識
+🇹🇼  OpenCC  s2twp                  → 統一轉成繁體中文
+🔤  術語修正 + 整理                  → CloudWatch / kubectl / Terraform …
+📋  進剪貼簿（可選自動 ⌘V）          → 文字落在你的游標處
+```
+
+## 需求
+
+- macOS 13+（建議 Apple Silicon）
+- [Homebrew](https://brew.sh)
+- Xcode Command Line Tools — `xcode-select --install`
+- `whisper-cpp` 與 `opencc`（由安裝腳本自動裝好）
+
+## 安裝（從零，三步）
+
+```bash
+git clone https://github.com/gary0413/SayKey.git
+cd SayKey
+./scripts/bootstrap.sh
+```
+
+`bootstrap.sh` 會自動安裝 `whisper-cpp` + `opencc`、下載 `large-v3-turbo` 模型（約 547 MB）、
+建立本機程式碼簽章憑證，並編譯出 `dist/SayKey.app`。接著：
+
+```bash
+open dist/SayKey.app
+```
+
+選單列會出現麥克風圖示。完成——它**不需要任何特殊權限**就能用（純剪貼簿模式）。
+想要自動貼上，請看下方說明。
+
+## 使用方式
+
+1. 把游標放在任何能打字的地方——Slack、瀏覽器表單、VS Code、終端機。
+2. 按 **Control-Option-Space** 開始、說話、再按一次停止。
+3. 辨識結果進剪貼簿，按 **⌘V** 貼上；或開啟 `autoPaste` 讓它自動幫你貼。
+
+> 啟動後第一次辨識會慢個 1～2 秒（模型 + Metal 暖機），之後就很順。
+
+## 自動貼上與 Accessibility（可選）
+
+模擬送出 **⌘V** 需要 macOS 的 **Accessibility（輔助使用）** 權限。預設關閉
+（純剪貼簿是最安全、零權限的路徑）。要開啟，把設定改成 `"autoPaste": true`，
+下次錄音時 macOS 會跳出請求 → **打開設定** → 勾選 **SayKey**。
+這個權限**每台機器只需授權一次**，而且之後怎麼重新編譯都不會失效
+（原理見 [程式碼簽章](#程式碼簽章為什麼授權不會失效)）。
+
+## 設定
+
+設定檔位於 `~/.saykey/config.json`（選單 → **Open Config…** 會建立範本）：
+
+```json
+{
+  "whisperBinaryPath": "/opt/homebrew/bin/whisper-cli",
+  "modelPath": "~/.saykey/models/ggml-large-v3-turbo-q5_0.bin",
+  "language": "zh",
+  "autoPaste": false,
+  "convertToTraditional": true,
+  "contextualTerms": ["SRE", "CloudWatch", "kubectl", "你的服務名"],
+  "termReplacements": { "terra form": "Terraform", "cube control": "kubectl" }
+}
+```
+
+| 設定 | 預設 | 作用 |
+|---|---|---|
+| `whisperBinaryPath` | `/opt/homebrew/bin/whisper-cli` | whisper-cli 執行檔路徑。 |
+| `modelPath` | turbo q5_0 | whisper GGML 模型。越大越準、越慢。 |
+| `language` | `zh` | 適合中文為主的混講；也可用 `auto` / `en`。 |
+| `autoPaste` | `false` | `true` 會自動送 ⌘V（需 Accessibility 權限）。 |
+| `convertToTraditional` | `true` | 用 OpenCC `s2twp` 把簡體轉台灣繁體；沒裝 opencc 會自動跳過。 |
+| `contextualTerms` | SRE 詞庫 | 餵給 whisper prompt 的術語，幫助拼對服務名、縮寫。 |
+| `termReplacements` | 常見修正 | 辨識後的固定修正，例如某個老是被聽錯的詞 → 正確拼法。 |
+
+也可用環境變數覆蓋（`SAYKEY_MODEL_PATH`、`SAYKEY_LANGUAGE`、`SAYKEY_AUTO_PASTE`、`SAYKEY_TERMS`…）。
+
+## 調整準確度
+
+- **換大模型**＝單一最有效的提升。`large-v3-turbo`（預設）CP 值最高；`medium` / `large-v3` 更準但更重。
+- **自己修常錯字** — 某個詞每次都被聽錯，就在 `termReplacements` 加一條（例如 `"terrafone": "Terraform"`），**下一句立即生效、免重新編譯**。
+- **加入你的詞彙** — 把內部服務名、縮寫放進 `contextualTerms`，讓 whisper 拼對。
+
+## 隱私
+
+你的聲音會錄成暫存檔、在裝置上辨識，然後**立即刪除**。辨識路徑裡完全沒有網路程式碼，
+什麼都不會上傳。剪貼簿會保留最後一段辨識結果（這就是貼上的來源）。
+
+## 程式碼簽章（為什麼授權不會失效）
+
+macOS 把 Accessibility 授權綁在 App 的**程式碼簽章身分**上。Ad-hoc 簽章的身分是
+**每次編譯都會變的雜湊（cdhash）**，所以一重新編譯授權就失效。SayKey 改用
+**本機專用的穩定自簽憑證**（`scripts/setup_signing.sh`）把身分綁在憑證上，
+讓你**授權一次、永久有效**。私鑰只存在你的登入鑰匙圈、絕不進 git；每台機器各自產一張。
+細節見 [`scripts/setup_signing.sh`](scripts/setup_signing.sh) 與 [`scripts/build_app.sh`](scripts/build_app.sh) 的註解。
+
+---
+
+## License
+
+[MIT](LICENSE) © 2026 Gary Yu
+
+Built on [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and [OpenCC](https://github.com/BYVoid/OpenCC).
+
+<sub>English speaker? SayKey is a local, privacy-first push-to-talk dictation tool for macOS, optimised for mixed Chinese–English ("code-switching") speech with Traditional Chinese output. Same install steps above.</sub>
