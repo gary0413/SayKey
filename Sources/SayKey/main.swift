@@ -458,6 +458,7 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
     private var recordingURL: URL?
     private var recordingStartedAt: Date?
     private var autoPasteForCurrentRecognition = false
+    private var recordingTargetPID: pid_t?
     private var state: RecorderState = .idle
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
@@ -467,6 +468,14 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+
+        // A subprocess (e.g. OpenCC) that exits while we're writing to its stdin
+        // makes the write raise SIGPIPE, which would kill us; ignore it and let
+        // the write fail as a recoverable error instead.
+        signal(SIGPIPE, SIG_IGN)
+
+        // Delete any recording WAVs a previous crash / force-quit left behind.
+        sweepStaleRecordings()
 
         // Load once so the menu labels + hotkey + warm server all use the same
         // config. Changing the hotkey needs an app restart (Carbon registers it
@@ -750,6 +759,8 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
         self.recordingURL = url
         self.recordingStartedAt = Date()
         self.autoPasteForCurrentRecognition = config.autoPaste
+        // Remember which app was focused so we only auto-paste back into it.
+        self.recordingTargetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         self.state = .recording
         updateStatus(title: "Recording")
     }
@@ -789,12 +800,18 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
         do {
             let config = try AppConfig.load()
             try validateWhisper(config)
-            // Prefer the warm server (model already loaded); fall back to the CLI
-            // if it isn't ready yet or errors. An empty string is a valid result
-            // (VAD filtered silence) and must NOT trigger the fallback.
+            // Lazily (re)start the warm server if it died since launch — otherwise
+            // one crash would permanently downgrade us to the slower CLI path.
+            if !WhisperServerManager.shared.isReady {
+                WhisperServerManager.shared.startIfNeeded(config: config)
+            }
+            // Prefer the warm server (model already loaded). If it's up, let its
+            // errors surface rather than silently paying a second full CLI
+            // timeout; only use the CLI when the server isn't ready yet. An empty
+            // string is a valid result (VAD filtered silence).
             let rawText: String
-            if let serverText = try? WhisperServerManager.shared.transcribe(fileURL: url) {
-                rawText = serverText
+            if WhisperServerManager.shared.isReady {
+                rawText = try WhisperServerManager.shared.transcribe(fileURL: url)
             } else {
                 rawText = try await WhisperTranscriber.transcribe(fileURL: url, config: config)
             }
@@ -815,7 +832,7 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
                     return
                 }
 
-                deliverTranscript(text, autoPaste: autoPaste)
+                deliverTranscript(text, autoPaste: autoPaste, verifyTarget: true)
                 rememberTranscript(text)
                 state = .idle
                 updateStatus(title: "Ready")
@@ -846,11 +863,31 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
         let directory = FileManager.default
             .urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("SayKey", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Owner-only (0700): the recorded voice audio should not be readable by
+        // other processes on the machine.
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         return directory
     }
 
-    private func deliverTranscript(_ text: String, autoPaste: Bool) {
+    /// Delete voice-*.wav files left over from a previous crash / force-quit so
+    /// recorded audio never lingers on disk.
+    private func sweepStaleRecordings() {
+        guard let directory = try? recordingDirectory(),
+              let files = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+        else {
+            return
+        }
+        for name in files where name.hasPrefix("voice-") && name.hasSuffix(".wav") {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+        }
+    }
+
+    private func deliverTranscript(_ text: String, autoPaste: Bool, verifyTarget: Bool = false) {
         let pasteboard = NSPasteboard.general
 
         // In auto-paste mode, snapshot the user's clipboard BEFORE we overwrite
@@ -863,6 +900,16 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
         pasteboard.setString(text, forType: .string)
 
         guard autoPaste else {
+            return
+        }
+
+        // Only auto-paste if the app that was focused when recording started is
+        // still frontmost — otherwise the transcript would land in the wrong app.
+        // (Skipped for explicit re-paste, which targets the current focus.)
+        if verifyTarget,
+           let target = recordingTargetPID,
+           NSWorkspace.shared.frontmostApplication?.processIdentifier != target {
+            statusItem.button?.toolTip = "SayKey: 焦點已切換，文字留在剪貼簿（請手動 ⌘V）"
             return
         }
 
@@ -1085,7 +1132,7 @@ private final class WhisperServerManager {
     private var ready = false
     private let port = 8471
 
-    private var isReady: Bool {
+    var isReady: Bool {
         lock.lock(); defer { lock.unlock() }
         return ready
     }
@@ -1166,9 +1213,20 @@ private final class WhisperServerManager {
     }
 
     private func freeStalePort() {
+        // Reap ONLY an orphaned whisper-server (from a prior force-quit) — never
+        // blind-kill whatever holds the port, which could be an unrelated process
+        // (a dev server, a debugger). Verify the listener's command name first,
+        // and send SIGTERM (graceful), not SIGKILL.
+        let script = """
+        for pid in $(lsof -nP -iTCP:\(port) -sTCP:LISTEN -t 2>/dev/null); do
+          case "$(ps -p "$pid" -o comm= 2>/dev/null)" in
+            *whisper-server*) kill "$pid" 2>/dev/null ;;
+          esac
+        done
+        """
         let killer = Process()
         killer.executableURL = URL(fileURLWithPath: "/bin/sh")
-        killer.arguments = ["-c", "lsof -ti tcp:\(port) | xargs kill -9 2>/dev/null || true"]
+        killer.arguments = ["-c", script]
         try? killer.run()
         killer.waitUntilExit()
     }
@@ -1394,16 +1452,24 @@ private enum TraditionalConverter {
 
         do {
             try process.run()
-            // Write stdin on a background queue while we drain stdout on this
-            // one. Doing both inline would deadlock on long transcripts once
-            // OpenCC fills its stdout pipe buffer before we start reading.
+
+            // Watchdog: if OpenCC ever hangs, terminate it so transcription can't
+            // block forever (we then fail open and return the original text).
+            let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: watchdog)
+
+            // Write stdin on a background queue while we drain stdout on this one
+            // (doing both inline would deadlock once OpenCC fills its stdout pipe
+            // buffer). Use the THROWING write so an early-exiting child that
+            // breaks the pipe becomes a caught error, not a crash.
             let inputData = Data(text.utf8)
             DispatchQueue.global(qos: .userInitiated).async {
-                stdin.fileHandleForWriting.write(inputData)
-                stdin.fileHandleForWriting.closeFile()
+                try? stdin.fileHandleForWriting.write(contentsOf: inputData)
+                try? stdin.fileHandleForWriting.close()
             }
             let outData = stdout.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
+            watchdog.cancel()
 
             guard process.terminationStatus == 0,
                   let converted = String(data: outData, encoding: .utf8)

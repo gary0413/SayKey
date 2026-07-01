@@ -46,12 +46,14 @@ openssl pkcs12 -export \
   -passout pass:saykey >/dev/null 2>&1
 
 echo "Importing identity into login keychain..."
-# -A lets codesign use the private key without a per-use keychain prompt.
+# -T /usr/bin/codesign lets ONLY codesign use the key without a keychain prompt.
+# We intentionally do NOT pass -A (which would let *any* app use the signing
+# key silently). The first build may show a one-time keychain prompt — click
+# "Always Allow".
 security import "$WORK_DIR/identity.p12" \
   -k "$KEYCHAIN" \
   -P saykey \
-  -T /usr/bin/codesign \
-  -A >/dev/null 2>&1
+  -T /usr/bin/codesign >/dev/null 2>&1
 
 echo "Trusting certificate for code signing (user domain, no admin needed)..."
 # User-domain trust only; does NOT touch the system trust store.

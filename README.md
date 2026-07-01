@@ -22,7 +22,7 @@ English 技術詞拼寫正確。
 
 - 🗣️ **為中英混講而生** — 說「幫我看一下 CloudWatch 的 p95 latency，然後 rollback 那個 deployment」，它就照寫，English 術語完整保留。
 - 🇹🇼 **一律繁體中文** — Whisper 常吐簡體；SayKey 透過 OpenCC 把每段結果統一轉成台灣繁體（軟體 ≠ 软件、列印 ≠ 打印）。
-- 🔒 **完全本機、隱私** — 用 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) 在裝置上辨識。不串 OpenAI API、不靠 Siri、不連網路，飛航模式也能用。
+- 🔒 **完全本機、隱私** — 用 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) 在裝置上辨識。不串 OpenAI API、不靠 Siri、不連外部網路，飛航模式也能用。
 - 🧠 **聽得懂你的術語** — 內建 SRE / DevOps 詞庫（kubectl、Terraform、PagerDuty、5xx、p95…），還能自訂專屬的「常錯字」修正表。
 - ⚡ **不擋路** — 一個選單列麥克風圖示、閒置時 ~0% CPU、全域快捷鍵、沒有 Dock 圖示、不用註冊帳號。
 
@@ -139,8 +139,12 @@ open dist/SayKey.app
 
 ## 隱私
 
-你的聲音會錄成暫存檔、在裝置上辨識，然後**立即刪除**。辨識路徑裡完全沒有網路程式碼，
-什麼都不會上傳。剪貼簿會保留最後一段辨識結果（這就是貼上的來源）。
+你的聲音會錄成暫存檔（權限 0600、辨識完刪除，crash 殘留的也會在下次啟動清掉），
+辨識**全程在你的 Mac 上完成、不會上傳任何外部伺服器**，飛航模式也能用。
+
+> 技術細節：為了讓模型常駐加速，預設會透過 **127.0.0.1（loopback）本機連線**把音訊交給你電腦上的 `whisper-server`——這條連線只在你的 Mac 內部、不出網。想完全不啟動本機服務可設 `useServer: false`（改用 CLI 逐次辨識）。
+
+剪貼簿會保留最後一段辨識結果（這就是貼上的來源）。
 
 ## 程式碼簽章（為什麼授權不會失效）
 
