@@ -43,22 +43,29 @@ English 技術詞拼寫正確。
 - Xcode Command Line Tools — `xcode-select --install`
 - `whisper-cpp` 與 `opencc`（由安裝腳本自動裝好）
 
-## 安裝（從零，三步）
+## 安裝
+
+### 方式 A（最簡單）：Homebrew
+
+```bash
+brew install --cask gary0413/tap/saykey
+```
+
+一行搞定：自動裝好 `whisper-cpp` + `opencc`、下載語音與 VAD 模型到 `~/.saykey/models`、
+安裝 App 並去除下載隔離（不會被 Gatekeeper 擋）。裝完在「應用程式」打開 SayKey 即可。
+
+### 方式 B：自己 build（開發或想改程式）
 
 ```bash
 git clone https://github.com/gary0413/SayKey.git
 cd SayKey
 ./scripts/bootstrap.sh
-```
-
-`bootstrap.sh` 會自動安裝 `whisper-cpp` + `opencc`、下載 `large-v3-turbo` 模型（約 547 MB）、
-建立本機程式碼簽章憑證，並編譯出 `dist/SayKey.app`。接著：
-
-```bash
 open dist/SayKey.app
 ```
 
-選單列會出現麥克風圖示。完成——它**不需要任何特殊權限**就能用（純剪貼簿模式）。
+`bootstrap.sh` 會裝依賴、下載模型、建立本機簽章、編譯出 `dist/SayKey.app`。
+
+完成後選單列會出現麥克風圖示——它**不需要任何特殊權限**就能用（純剪貼簿模式）；
 想要自動貼上，請看下方說明。
 
 ## 使用方式
