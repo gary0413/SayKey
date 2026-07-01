@@ -69,6 +69,12 @@ private struct FileConfig: Decodable {
     // clipboard-only mode).
     let soundFeedback: Bool?
 
+    // Keep a warm whisper-server running so the model is loaded once instead of
+    // re-loaded (~300ms) on every utterance. Falls back to the CLI if the
+    // server isn't up yet or fails.
+    let useServer: Bool?
+    let whisperServerBinaryPath: String?
+
     // Older Apple Speech config keys are tolerated so existing files do not fail.
     let localeIdentifier: String?
     let requiresOnDeviceRecognition: Bool?
@@ -87,6 +93,8 @@ private struct AppConfig {
     let enableVAD: Bool
     let vadModelPath: String
     let soundFeedback: Bool
+    let useServer: Bool
+    let whisperServerBinaryPath: String
 
     static let configDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".saykey", isDirectory: true)
@@ -180,6 +188,15 @@ private struct AppConfig {
             ?? fileConfig?.soundFeedback
             ?? true
 
+        let useServer = parseBool(env["SAYKEY_USE_SERVER"])
+            ?? fileConfig?.useServer
+            ?? true
+
+        let whisperServerBinaryPath = firstNonEmpty(
+            env["SAYKEY_WHISPER_SERVER_BIN"],
+            fileConfig?.whisperServerBinaryPath
+        ) ?? "/opt/homebrew/bin/whisper-server"
+
         return AppConfig(
             whisperBinaryPath: NSString(string: whisperBinaryPath).expandingTildeInPath,
             modelPath: NSString(string: modelPath).expandingTildeInPath,
@@ -192,7 +209,9 @@ private struct AppConfig {
             openCCConfig: openCCConfig,
             enableVAD: enableVAD,
             vadModelPath: NSString(string: vadModelPath).expandingTildeInPath,
-            soundFeedback: soundFeedback
+            soundFeedback: soundFeedback,
+            useServer: useServer,
+            whisperServerBinaryPath: NSString(string: whisperServerBinaryPath).expandingTildeInPath
         )
     }
 
@@ -212,6 +231,7 @@ private struct AppConfig {
               "convertToTraditional": true,
               "enableVAD": true,
               "soundFeedback": true,
+              "useServer": true,
               "contextualTerms": [
                 "SRE",
                 "AWS",
@@ -343,6 +363,12 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
         updateStatus(title: "Ready")
         requestMicrophonePermissionIfNeeded()
 
+        // Warm the whisper server so the first (and every) utterance skips the
+        // ~300ms model reload. Safe if it fails — transcription falls back to CLI.
+        if let config = try? AppConfig.load() {
+            WhisperServerManager.shared.startIfNeeded(config: config)
+        }
+
         do {
             try registerHotKey()
         } catch {
@@ -352,6 +378,7 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         recorder?.stop()
+        WhisperServerManager.shared.stop()
         if let hotKeyRef {
             UnregisterEventHotKey(hotKeyRef)
         }
@@ -645,7 +672,15 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
         do {
             let config = try AppConfig.load()
             try validateWhisper(config)
-            let rawText = try await WhisperTranscriber.transcribe(fileURL: url, config: config)
+            // Prefer the warm server (model already loaded); fall back to the CLI
+            // if it isn't ready yet or errors. An empty string is a valid result
+            // (VAD filtered silence) and must NOT trigger the fallback.
+            let rawText: String
+            if let serverText = try? WhisperServerManager.shared.transcribe(fileURL: url) {
+                rawText = serverText
+            } else {
+                rawText = try await WhisperTranscriber.transcribe(fileURL: url, config: config)
+            }
             let traditional = TraditionalConverter.convert(rawText, config: config)
             let text = normalizeTranscript(traditional, replacements: config.termReplacements)
             try? FileManager.default.removeItem(at: url)
@@ -867,6 +902,188 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
     }
 }
 
+/// Keeps a single `whisper-server` process warm so the model is loaded once at
+/// launch instead of re-loaded (~300ms) on every utterance. Transcription is a
+/// local HTTP POST to `/inference`. Everything degrades to the per-utterance CLI
+/// path if the server isn't up, so this is a pure latency optimisation that can
+/// never break transcription.
+private final class WhisperServerManager {
+    static let shared = WhisperServerManager()
+
+    private enum ServerError: Error { case notReady, timeout, badStatus(Int) }
+
+    private let lock = NSLock()
+    private var process: Process?
+    private var ready = false
+    private let port = 8471
+
+    private var isReady: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return ready
+    }
+
+    private var baseURL: URL {
+        URL(string: "http://127.0.0.1:\(port)")!
+    }
+
+    func startIfNeeded(config: AppConfig) {
+        guard config.useServer else { return }
+        lock.lock()
+        let alreadyStarted = process != nil
+        lock.unlock()
+        guard !alreadyStarted else { return }
+
+        guard FileManager.default.isExecutableFile(atPath: config.whisperServerBinaryPath),
+              FileManager.default.fileExists(atPath: config.modelPath) else {
+            return
+        }
+
+        var arguments = [
+            "-m", config.modelPath,
+            "--host", "127.0.0.1",
+            "--port", "\(port)",
+            "--language", config.language,
+            "--prompt", config.prompt,
+            "--beam-size", "5",
+            "--suppress-nst"
+        ]
+        if config.enableVAD, FileManager.default.fileExists(atPath: config.vadModelPath) {
+            arguments += ["--vad", "--vad-model", config.vadModelPath, "--vad-speech-pad-ms", "200"]
+        }
+
+        // Free the port in case a previous run was force-quit and orphaned its
+        // server (children aren't auto-reaped on macOS). Best-effort.
+        freeStalePort()
+
+        let server = Process()
+        server.executableURL = URL(fileURLWithPath: config.whisperServerBinaryPath)
+        server.arguments = arguments
+        // Discard server logs; readiness is checked over HTTP, so there's no pipe
+        // to keep drained.
+        server.standardOutput = FileHandle.nullDevice
+        server.standardError = FileHandle.nullDevice
+        server.environment = ProcessInfo.processInfo.environment.merging([
+            "GGML_METAL_PATH_RESOURCES": "/opt/homebrew/lib"
+        ]) { current, _ in current }
+        server.terminationHandler = { [weak self] _ in
+            guard let self else { return }
+            self.lock.lock()
+            self.ready = false
+            self.process = nil
+            self.lock.unlock()
+        }
+
+        do {
+            try server.run()
+        } catch {
+            return
+        }
+
+        lock.lock()
+        process = server
+        lock.unlock()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.waitUntilReady()
+        }
+    }
+
+    func stop() {
+        lock.lock()
+        let server = process
+        process = nil
+        ready = false
+        lock.unlock()
+        server?.terminate()
+    }
+
+    private func freeStalePort() {
+        let killer = Process()
+        killer.executableURL = URL(fileURLWithPath: "/bin/sh")
+        killer.arguments = ["-c", "lsof -ti tcp:\(port) | xargs kill -9 2>/dev/null || true"]
+        try? killer.run()
+        killer.waitUntilExit()
+    }
+
+    private func waitUntilReady() {
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            if ping() {
+                lock.lock(); ready = true; lock.unlock()
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.4)
+        }
+    }
+
+    private func ping() -> Bool {
+        var request = URLRequest(url: baseURL)
+        request.timeoutInterval = 1
+        let semaphore = DispatchSemaphore(value: 0)
+        var up = false
+        let task = URLSession.shared.dataTask(with: request) { _, response, error in
+            // Any HTTP response (even 404) means the port is accepting.
+            if error == nil || response != nil { up = true }
+            semaphore.signal()
+        }
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + 1.5)
+        return up
+    }
+
+    /// Synchronous POST to the warm server. Callers run this off the main thread.
+    func transcribe(fileURL: URL) throws -> String {
+        guard isReady else { throw ServerError.notReady }
+
+        let boundary = "saykey-\(UUID().uuidString)"
+        var request = URLRequest(url: baseURL.appendingPathComponent("inference"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 125
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+        var body = Data()
+        let audio = try Data(contentsOf: fileURL)
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
+        body.append(audio)
+        body.append("\r\n".data(using: .utf8)!)
+        for (name, value) in [("response_format", "json"), ("temperature", "0")] {
+            body.append("--\(boundary)\r\n".data(using: .utf8)!)
+            body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
+            body.append("\(value)\r\n".data(using: .utf8)!)
+        }
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+        request.httpBody = body
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var responseData: Data?
+        var httpError: Error?
+        var status = 0
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            responseData = data
+            httpError = error
+            if let http = response as? HTTPURLResponse { status = http.statusCode }
+            semaphore.signal()
+        }
+        task.resume()
+        if semaphore.wait(timeout: .now() + 130) == .timedOut {
+            task.cancel()
+            throw ServerError.timeout
+        }
+        if let httpError { throw httpError }
+        guard status == 200, let data = responseData else {
+            throw ServerError.badStatus(status)
+        }
+
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let text = object["text"] as? String {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+}
+
 private enum WhisperTranscriber {
     static func transcribe(fileURL: URL, config: AppConfig) async throws -> String {
         try await Task.detached(priority: .userInitiated) {
@@ -1035,6 +1252,9 @@ private enum TraditionalConverter {
 
 private func normalizeTranscript(_ rawText: String, replacements: [String: String]) -> String {
     var text = rawText
+        // whisper (esp. the server) breaks segments with newlines; for
+        // dictation-into-a-field these should be spaces, not line breaks.
+        .replacingOccurrences(of: "\n", with: " ")
         .replacingOccurrences(of: "，", with: ", ")
         .replacingOccurrences(of: "。", with: ". ")
         .replacingOccurrences(of: "、", with: ", ")

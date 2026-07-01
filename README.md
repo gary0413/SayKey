@@ -102,6 +102,7 @@ open dist/SayKey.app
 | `convertToTraditional` | `true` | 用 OpenCC `s2twp` 把簡體轉台灣繁體；沒裝 opencc 會自動跳過。 |
 | `enableVAD` | `true` | 用 Silero VAD 先切掉靜音/雜訊段，大幅減少「沒講話卻生出字」的幻聽。VAD 模型不存在則自動跳過。 |
 | `soundFeedback` | `true` | 辨識完成播一個短音效當「好了」提示（純剪貼簿模式下的主要回饋）。 |
+| `useServer` | `true` | 啟動時常駐一個 `whisper-server`，模型只載一次，每句省掉約 300ms 重新載入。啟動中或失敗會自動退回 CLI，不影響辨識。 |
 | `contextualTerms` | SRE 詞庫 | 餵給 whisper prompt 的術語，幫助拼對服務名、縮寫。 |
 | `termReplacements` | 常見修正 | 辨識後的固定修正，例如某個老是被聽錯的詞 → 正確拼法。 |
 
