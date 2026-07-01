@@ -144,6 +144,12 @@ private struct FileConfig: Decodable {
     // the paste, instead of leaving the transcript there.
     let restoreClipboard: Bool?
 
+    // Punctuation policy: "half" (Chinese full-width -> half-width), "full"
+    // (half-width next to CJK -> full-width), or "keep" (leave whisper's output).
+    let punctuation: String?
+    // Add a half-width space between CJK and adjacent Latin letters / digits.
+    let autoSpacing: Bool?
+
     // Older Apple Speech config keys are tolerated so existing files do not fail.
     let localeIdentifier: String?
     let requiresOnDeviceRecognition: Bool?
@@ -168,6 +174,8 @@ private struct AppConfig {
     let hotKeyModifiers: UInt32
     let hotKeyDisplay: String
     let restoreClipboard: Bool
+    let punctuation: String
+    let autoSpacing: Bool
 
     static let configDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".saykey", isDirectory: true)
@@ -277,6 +285,15 @@ private struct AppConfig {
             ?? fileConfig?.restoreClipboard
             ?? true
 
+        let punctuation = firstNonEmpty(env["SAYKEY_PUNCTUATION"], fileConfig?.punctuation)
+            .map { $0.lowercased() }
+            .flatMap { ["half", "full", "keep"].contains($0) ? $0 : nil }
+            ?? "half"
+
+        let autoSpacing = parseBool(env["SAYKEY_SPACING"])
+            ?? fileConfig?.autoSpacing
+            ?? true
+
         return AppConfig(
             whisperBinaryPath: NSString(string: whisperBinaryPath).expandingTildeInPath,
             modelPath: NSString(string: modelPath).expandingTildeInPath,
@@ -295,7 +312,9 @@ private struct AppConfig {
             hotKeyCode: parsedHotKey?.code ?? defaultHotKeyCode,
             hotKeyModifiers: parsedHotKey?.modifiers ?? defaultHotKeyModifiers,
             hotKeyDisplay: parsedHotKey?.display ?? defaultHotKeyDisplay,
-            restoreClipboard: restoreClipboard
+            restoreClipboard: restoreClipboard,
+            punctuation: punctuation,
+            autoSpacing: autoSpacing
         )
     }
 
@@ -318,6 +337,8 @@ private struct AppConfig {
               "useServer": true,
               "hotkey": "control-option-space",
               "restoreClipboard": true,
+              "punctuation": "half",
+              "autoSpacing": true,
               "contextualTerms": [
                 "SRE",
                 "AWS",
@@ -778,7 +799,12 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
                 rawText = try await WhisperTranscriber.transcribe(fileURL: url, config: config)
             }
             let traditional = TraditionalConverter.convert(rawText, config: config)
-            let text = normalizeTranscript(traditional, replacements: config.termReplacements)
+            let text = normalizeTranscript(
+                traditional,
+                replacements: config.termReplacements,
+                punctuation: config.punctuation,
+                autoSpacing: config.autoSpacing
+            )
             try? FileManager.default.removeItem(at: url)
 
             await MainActor.run {
@@ -1392,17 +1418,28 @@ private enum TraditionalConverter {
     }
 }
 
-private func normalizeTranscript(_ rawText: String, replacements: [String: String]) -> String {
-    var text = rawText
-        // whisper (esp. the server) breaks segments with newlines; for
-        // dictation-into-a-field these should be spaces, not line breaks.
-        .replacingOccurrences(of: "\n", with: " ")
-        .replacingOccurrences(of: "，", with: ", ")
-        .replacingOccurrences(of: "。", with: ". ")
-        .replacingOccurrences(of: "、", with: ", ")
+private func normalizeTranscript(
+    _ rawText: String,
+    replacements: [String: String],
+    punctuation: String,
+    autoSpacing: Bool
+) -> String {
+    // whisper (esp. the server) breaks segments with newlines; for
+    // dictation-into-a-field these should be spaces, not line breaks.
+    var text = rawText.replacingOccurrences(of: "\n", with: " ")
+
+    switch punctuation {
+    case "half": text = halfWidthPunctuation(text)
+    case "full": text = fullWidthPunctuation(text)
+    default: break // "keep" — leave whisper's punctuation as-is
+    }
 
     for (from, to) in replacements.sorted(by: { $0.key.count > $1.key.count }) {
         text = replaceCaseInsensitive(text, from: from, to: to)
+    }
+
+    if autoSpacing {
+        text = addCJKLatinSpacing(text)
     }
 
     while text.contains("  ") {
@@ -1410,6 +1447,44 @@ private func normalizeTranscript(_ rawText: String, replacements: [String: Strin
     }
 
     return text.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// Chinese full-width punctuation → half-width (with a trailing space).
+private func halfWidthPunctuation(_ text: String) -> String {
+    var result = text
+    let pairs = [("，", ", "), ("。", ". "), ("、", ", "), ("；", "; "),
+                 ("：", ": "), ("？", "? "), ("！", "! ")]
+    for (full, half) in pairs {
+        result = result.replacingOccurrences(of: full, with: half)
+    }
+    return result
+}
+
+/// Half-width punctuation → Chinese full-width, but ONLY when adjacent to a CJK
+/// character, so English fragments ("Hello, k8s", "v0.12.0", "3.5") are left alone.
+private func fullWidthPunctuation(_ text: String) -> String {
+    var result = text
+    let pairs = [(",", "，"), (".", "。"), (";", "；"), (":", "："), ("?", "？"), ("!", "！")]
+    for (half, full) in pairs {
+        let pattern = "([\\p{Han}])\\s*" + NSRegularExpression.escapedPattern(for: half) + "\\s*"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+        let range = NSRange(result.startIndex..., in: result)
+        result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "$1" + full)
+    }
+    return result
+}
+
+/// Inserts a half-width space between a CJK character and an adjacent Latin
+/// letter or digit (pangu spacing), e.g. "看CloudWatch的p95" → "看 CloudWatch 的 p95".
+private func addCJKLatinSpacing(_ text: String) -> String {
+    var result = text
+    let patterns = ["([\\p{Han}])([A-Za-z0-9])", "([A-Za-z0-9])([\\p{Han}])"]
+    for pattern in patterns {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+        let range = NSRange(result.startIndex..., in: result)
+        result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "$1 $2")
+    }
+    return result
 }
 
 private func replaceCaseInsensitive(_ text: String, from: String, to: String) -> String {

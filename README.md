@@ -114,6 +114,8 @@ open dist/SayKey.app
 | `useServer` | `true` | 啟動時常駐一個 `whisper-server`，模型只載一次，每句省掉約 300ms 重新載入。啟動中或失敗會自動退回 CLI，不影響辨識。 |
 | `hotkey` | `control-option-space` | 全域快捷鍵，例如 `cmd-shift-d`、`ctrl-opt-v`。需至少一個修飾鍵（`control`/`option`/`command`/`shift`）＋一個鍵（`space`/`a`–`z`/`0`–`9`/`return`/`tab`）。**改了要重開 App 才生效**；無法解析會退回預設。 |
 | `restoreClipboard` | `true` | 自動貼上模式下，貼完把你原本的剪貼簿內容還原，不讓辨識結果蓋掉你剛複製的東西。純剪貼簿模式（`autoPaste=false`）不受影響、辨識結果照樣留在剪貼簿。 |
+| `punctuation` | `half` | 標點策略：`half`（中文全形→半形，技術場景順）、`full`（貼著中文的半形標點→全形，中文散文自然；英文片段如 `Hello, k8s`、`v0.12.0` 不會被誤動）、`keep`（保留 whisper 原樣）。 |
+| `autoSpacing` | `true` | 在中文與相鄰的英文字母/數字之間自動補半形空格，例如 `看CloudWatch的p95` → `看 CloudWatch 的 p95`。 |
 | `contextualTerms` | SRE 詞庫 | 餵給 whisper prompt 的術語，幫助拼對服務名、縮寫。 |
 | `termReplacements` | 常見修正 | 辨識後的固定修正，例如某個老是被聽錯的詞 → 正確拼法。 |
 
