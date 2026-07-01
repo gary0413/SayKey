@@ -140,6 +140,10 @@ private struct FileConfig: Decodable {
     // restart to take effect.
     let hotkey: String?
 
+    // In auto-paste mode, restore whatever the user had on the clipboard after
+    // the paste, instead of leaving the transcript there.
+    let restoreClipboard: Bool?
+
     // Older Apple Speech config keys are tolerated so existing files do not fail.
     let localeIdentifier: String?
     let requiresOnDeviceRecognition: Bool?
@@ -163,6 +167,7 @@ private struct AppConfig {
     let hotKeyCode: UInt32
     let hotKeyModifiers: UInt32
     let hotKeyDisplay: String
+    let restoreClipboard: Bool
 
     static let configDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".saykey", isDirectory: true)
@@ -268,6 +273,10 @@ private struct AppConfig {
         let parsedHotKey = firstNonEmpty(env["SAYKEY_HOTKEY"], fileConfig?.hotkey)
             .flatMap(parseHotKey)
 
+        let restoreClipboard = parseBool(env["SAYKEY_RESTORE_CLIPBOARD"])
+            ?? fileConfig?.restoreClipboard
+            ?? true
+
         return AppConfig(
             whisperBinaryPath: NSString(string: whisperBinaryPath).expandingTildeInPath,
             modelPath: NSString(string: modelPath).expandingTildeInPath,
@@ -285,7 +294,8 @@ private struct AppConfig {
             whisperServerBinaryPath: NSString(string: whisperServerBinaryPath).expandingTildeInPath,
             hotKeyCode: parsedHotKey?.code ?? defaultHotKeyCode,
             hotKeyModifiers: parsedHotKey?.modifiers ?? defaultHotKeyModifiers,
-            hotKeyDisplay: parsedHotKey?.display ?? defaultHotKeyDisplay
+            hotKeyDisplay: parsedHotKey?.display ?? defaultHotKeyDisplay,
+            restoreClipboard: restoreClipboard
         )
     }
 
@@ -307,6 +317,7 @@ private struct AppConfig {
               "soundFeedback": true,
               "useServer": true,
               "hotkey": "control-option-space",
+              "restoreClipboard": true,
               "contextualTerms": [
                 "SRE",
                 "AWS",
@@ -815,6 +826,13 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
 
     private func deliverTranscript(_ text: String, autoPaste: Bool) {
         let pasteboard = NSPasteboard.general
+
+        // In auto-paste mode, snapshot the user's clipboard BEFORE we overwrite
+        // it so we can put it back after the paste. In clipboard-only mode the
+        // transcript is meant to stay on the clipboard, so we never restore.
+        let shouldRestore = autoPaste && ((try? AppConfig.load())?.restoreClipboard ?? true)
+        let previousClipboard = shouldRestore ? snapshotPasteboard() : nil
+
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
 
@@ -832,7 +850,46 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
         // asynchronously and would otherwise paste stale/empty content.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             self.postPasteKeystroke()
+
+            // Restore the user's clipboard once the paste has consumed the
+            // transcript, so auto-paste doesn't silently clobber what they copied.
+            if let previousClipboard {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    self.restorePasteboard(previousClipboard)
+                }
+            }
         }
+    }
+
+    private func snapshotPasteboard() -> [[NSPasteboard.PasteboardType: Data]] {
+        guard let items = NSPasteboard.general.pasteboardItems else {
+            return []
+        }
+        return items.map { item in
+            var stored: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    stored[type] = data
+                }
+            }
+            return stored
+        }
+    }
+
+    private func restorePasteboard(_ snapshot: [[NSPasteboard.PasteboardType: Data]]) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard !snapshot.isEmpty else {
+            return
+        }
+        let items = snapshot.map { stored -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in stored {
+                item.setData(data, forType: type)
+            }
+            return item
+        }
+        pasteboard.writeObjects(items)
     }
 
     private func postPasteKeystroke() {
