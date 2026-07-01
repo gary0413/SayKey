@@ -29,6 +29,7 @@ English 技術詞拼寫正確。
 ```
 🎙  Control-Option-Space          → 開始錄音（16 kHz 單聲道）
 🎙  再按一次 Control-Option-Space   → 停止
+🔇  Silero VAD                     → 切掉靜音/雜訊，避免幻聽
 🧠  whisper.cpp（large-v3-turbo）  → 本機辨識
 🇹🇼  OpenCC  s2twp                  → 統一轉成繁體中文
 🔤  術語修正 + 整理                  → CloudWatch / kubectl / Terraform …
@@ -99,6 +100,8 @@ open dist/SayKey.app
 | `language` | `zh` | 適合中文為主的混講；也可用 `auto` / `en`。 |
 | `autoPaste` | `false` | `true` 會自動送 ⌘V（需 Accessibility 權限）。 |
 | `convertToTraditional` | `true` | 用 OpenCC `s2twp` 把簡體轉台灣繁體；沒裝 opencc 會自動跳過。 |
+| `enableVAD` | `true` | 用 Silero VAD 先切掉靜音/雜訊段，大幅減少「沒講話卻生出字」的幻聽。VAD 模型不存在則自動跳過。 |
+| `soundFeedback` | `true` | 辨識完成播一個短音效當「好了」提示（純剪貼簿模式下的主要回饋）。 |
 | `contextualTerms` | SRE 詞庫 | 餵給 whisper prompt 的術語，幫助拼對服務名、縮寫。 |
 | `termReplacements` | 常見修正 | 辨識後的固定修正，例如某個老是被聽錯的詞 → 正確拼法。 |
 

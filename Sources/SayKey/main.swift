@@ -12,66 +12,6 @@ private let defaultPrompt = """
 以下是繁體中文夾雜 SRE / DevOps 英文術語的值班口述，會出現服務名、CLI 指令與錯誤碼，例如：CloudWatch、kubectl、Terraform、PagerDuty、Datadog、Kubernetes、deployment、rollback、latency、timeout、incident、on-call、p95、5xx。
 """
 
-private let defaultTerms = [
-    "SRE",
-    "DevOps",
-    "AWS",
-    "CloudWatch",
-    "CloudTrail",
-    "ECS",
-    "EKS",
-    "EC2",
-    "ALB",
-    "NLB",
-    "IAM",
-    "VPC",
-    "Route 53",
-    "RDS",
-    "Redis",
-    "Kafka",
-    "Kubernetes",
-    "kubectl",
-    "Helm",
-    "Terraform",
-    "Docker",
-    "container",
-    "pod",
-    "node",
-    "deployment",
-    "service",
-    "ingress",
-    "autoscaling",
-    "latency",
-    "timeout",
-    "incident",
-    "runbook",
-    "playbook",
-    "alert",
-    "metric",
-    "log",
-    "trace",
-    "span",
-    "dashboard",
-    "Grafana",
-    "Prometheus",
-    "Datadog",
-    "PagerDuty",
-    "on-call",
-    "rollback",
-    "deploy",
-    "CI/CD",
-    "GitHub Actions",
-    "CLI",
-    "SSH",
-    "DNS",
-    "HTTP",
-    "HTTPS",
-    "4xx",
-    "5xx",
-    "p95",
-    "p99"
-]
-
 private let defaultTermReplacements: [String: String] = [
     "cloud watch": "CloudWatch",
     "cloudwatch": "CloudWatch",
@@ -120,6 +60,15 @@ private struct FileConfig: Decodable {
     let openCCBinaryPath: String?
     let openCCConfig: String?
 
+    // Voice Activity Detection: filters out silence/noise before the encoder so
+    // quiet or empty clips stop producing hallucinated captions.
+    let enableVAD: Bool?
+    let vadModelPath: String?
+
+    // Play a short sound when a transcript is ready (the main "done" cue in
+    // clipboard-only mode).
+    let soundFeedback: Bool?
+
     // Older Apple Speech config keys are tolerated so existing files do not fail.
     let localeIdentifier: String?
     let requiresOnDeviceRecognition: Bool?
@@ -135,13 +84,19 @@ private struct AppConfig {
     let convertToTraditional: Bool
     let openCCBinaryPath: String
     let openCCConfig: String
+    let enableVAD: Bool
+    let vadModelPath: String
+    let soundFeedback: Bool
 
     static let configDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".saykey", isDirectory: true)
     static let configFileURL = configDirectoryURL.appendingPathComponent("config.json")
-    static let defaultModelURL = configDirectoryURL
+    static let modelsDirectoryURL = configDirectoryURL
         .appendingPathComponent("models", isDirectory: true)
+    static let defaultModelURL = modelsDirectoryURL
         .appendingPathComponent("ggml-large-v3-turbo-q5_0.bin")
+    static let defaultVADModelURL = modelsDirectoryURL
+        .appendingPathComponent("ggml-silero-v6.2.0.bin")
 
     static func load() throws -> AppConfig {
         let fileConfig = try readFileConfig()
@@ -166,22 +121,29 @@ private struct AppConfig {
             ?? fileConfig?.autoPaste
             ?? false
 
-        var terms = defaultTerms
-        terms.append(contentsOf: fileConfig?.contextualTerms ?? [])
-        terms.append(contentsOf: fileConfig?.extraTerms ?? [])
+        // Only the user's OWN vocabulary is worth appending to the prompt. The
+        // generic term list is already covered by the primer, and a long comma
+        // list dilutes the primer and burns whisper's ~224-token budget, so we
+        // append at most a handful of the user's real terms (service names,
+        // internal acronyms) as a natural context line.
+        var userTerms = fileConfig?.contextualTerms ?? []
+        userTerms.append(contentsOf: fileConfig?.extraTerms ?? [])
         if let envTerms = env["SAYKEY_TERMS"] {
-            terms.append(
+            userTerms.append(
                 contentsOf: envTerms
                     .split(separator: ",")
                     .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
             )
         }
+        let cappedTerms = Array(deduplicated(userTerms).prefix(20))
 
         let prompt = firstNonEmpty(
             env["SAYKEY_PROMPT"],
             fileConfig?.prompt
-        ) ?? defaultPrompt + "\n額外詞彙: \(deduplicated(terms).joined(separator: ", "))"
+        ) ?? (cappedTerms.isEmpty
+            ? defaultPrompt
+            : defaultPrompt + "\n常用詞彙：" + cappedTerms.joined(separator: "、"))
 
         var replacements = defaultTermReplacements
         for (from, to) in fileConfig?.termReplacements ?? [:] {
@@ -204,6 +166,20 @@ private struct AppConfig {
             fileConfig?.openCCConfig
         ) ?? "s2twp.json"
 
+        // VAD is on by default; it only actually runs if the model file is present.
+        let enableVAD = parseBool(env["SAYKEY_VAD"])
+            ?? fileConfig?.enableVAD
+            ?? true
+
+        let vadModelPath = firstNonEmpty(
+            env["SAYKEY_VAD_MODEL"],
+            fileConfig?.vadModelPath
+        ) ?? defaultVADModelURL.path
+
+        let soundFeedback = parseBool(env["SAYKEY_SOUND"])
+            ?? fileConfig?.soundFeedback
+            ?? true
+
         return AppConfig(
             whisperBinaryPath: NSString(string: whisperBinaryPath).expandingTildeInPath,
             modelPath: NSString(string: modelPath).expandingTildeInPath,
@@ -213,7 +189,10 @@ private struct AppConfig {
             termReplacements: replacements,
             convertToTraditional: convertToTraditional,
             openCCBinaryPath: NSString(string: openCCBinaryPath).expandingTildeInPath,
-            openCCConfig: openCCConfig
+            openCCConfig: openCCConfig,
+            enableVAD: enableVAD,
+            vadModelPath: NSString(string: vadModelPath).expandingTildeInPath,
+            soundFeedback: soundFeedback
         )
     }
 
@@ -231,6 +210,8 @@ private struct AppConfig {
               "language": "zh",
               "autoPaste": false,
               "convertToTraditional": true,
+              "enableVAD": true,
+              "soundFeedback": true,
               "contextualTerms": [
                 "SRE",
                 "AWS",
@@ -342,6 +323,9 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
     private let menu = NSMenu()
     private let toggleMenuItem = NSMenuItem()
     private let lastTranscriptItem = NSMenuItem()
+    private let repasteMenuItem = NSMenuItem()
+    private let autoPasteMenuItem = NSMenuItem()
+    private let hud = RecordingHUD()
 
     private var recorder: AVAudioRecorder?
     private var recordingURL: URL?
@@ -351,6 +335,7 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
     private var hasShownAccessibilityHint = false
+    private var lastTranscript: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -400,6 +385,47 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
+    @objc private func toggleAutoPaste() {
+        let newValue = autoPasteMenuItem.state != .on
+        persistAutoPaste(newValue)
+        autoPasteMenuItem.state = newValue ? .on : .off
+        // Enabling auto-paste needs Accessibility; prompt now rather than making
+        // the user discover it fails on the next recording.
+        if newValue {
+            promptForAccessibilityIfNeeded()
+        }
+    }
+
+    /// Flips `autoPaste` in config.json, preserving every other key.
+    private func persistAutoPaste(_ enabled: Bool) {
+        let url = (try? AppConfig.ensureTemplateExists()) ?? AppConfig.configFileURL
+        guard
+            let data = try? Data(contentsOf: url),
+            var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            return
+        }
+        object["autoPaste"] = enabled
+        if let out = try? JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        ) {
+            try? out.write(to: url)
+        }
+    }
+
+    @objc private func repasteLast() {
+        guard let text = lastTranscript else {
+            return
+        }
+        let autoPaste = (try? AppConfig.load())?.autoPaste ?? false
+        deliverTranscript(text, autoPaste: autoPaste)
+    }
+
+    private func playDoneSound() {
+        NSSound(named: NSSound.Name("Pop"))?.play()
+    }
+
     private func configureMenu() {
         if let button = statusItem.button {
             if #available(macOS 11.0, *) {
@@ -415,9 +441,23 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
         toggleMenuItem.action = #selector(toggleRecordingFromMenu)
         menu.addItem(toggleMenuItem)
 
-        lastTranscriptItem.title = "Last transcript: none"
+        lastTranscriptItem.title = "上一句：（尚無）"
         lastTranscriptItem.isEnabled = false
         menu.addItem(lastTranscriptItem)
+
+        repasteMenuItem.title = "重貼上一句"
+        repasteMenuItem.target = self
+        repasteMenuItem.action = #selector(repasteLast)
+        repasteMenuItem.isEnabled = false
+        menu.addItem(repasteMenuItem)
+
+        menu.addItem(.separator())
+
+        autoPasteMenuItem.title = "自動貼上（需 Accessibility）"
+        autoPasteMenuItem.target = self
+        autoPasteMenuItem.action = #selector(toggleAutoPaste)
+        autoPasteMenuItem.state = ((try? AppConfig.load())?.autoPaste ?? false) ? .on : .off
+        menu.addItem(autoPasteMenuItem)
 
         menu.addItem(.separator())
 
@@ -622,6 +662,9 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
                 rememberTranscript(text)
                 state = .idle
                 updateStatus(title: "Ready")
+                if config.soundFeedback {
+                    playDoneSound()
+                }
             }
         } catch {
             try? FileManager.default.removeItem(at: url)
@@ -723,27 +766,42 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
     }
 
     private func rememberTranscript(_ text: String) {
+        lastTranscript = text
         let compact = text.replacingOccurrences(of: "\n", with: " ")
-        let preview = compact.count > 50
-            ? String(compact.prefix(50)) + "..."
+        let preview = compact.count > 40
+            ? String(compact.prefix(40)) + "…"
             : compact
-        lastTranscriptItem.title = "Last transcript: \(preview)"
+        lastTranscriptItem.title = "上一句：\(preview)"
+        repasteMenuItem.isEnabled = true
     }
 
     private func updateStatus(title: String) {
         switch state {
         case .idle:
-            toggleMenuItem.title = "Start Recording (Control-Option-Space)"
+            toggleMenuItem.title = "開始錄音（Control-Option-Space）"
             statusItem.button?.contentTintColor = nil
+            setStatusIcon("mic")
+            hud.hide()
         case .recording:
-            toggleMenuItem.title = "Stop and Transcribe (Control-Option-Space)"
+            toggleMenuItem.title = "停止並辨識（Control-Option-Space）"
             statusItem.button?.contentTintColor = .systemRed
+            setStatusIcon("mic.fill")
+            hud.show("🔴 錄音中… 再按一次快捷鍵停止")
         case .transcribing:
-            toggleMenuItem.title = "Transcribing..."
+            toggleMenuItem.title = "辨識中…"
             statusItem.button?.contentTintColor = .systemBlue
+            setStatusIcon("waveform")
+            hud.show("⏳ 辨識中…")
         }
 
         statusItem.button?.toolTip = "SayKey: \(title)"
+    }
+
+    private func setStatusIcon(_ symbolName: String) {
+        guard #available(macOS 11.0, *), let button = statusItem.button else {
+            return
+        }
+        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "SayKey")
     }
 
     private func requestMicrophonePermissionIfNeeded() {
@@ -816,10 +874,16 @@ private enum WhisperTranscriber {
         }.value
     }
 
+    /// Hard cap on a single transcription. whisper-turbo does short clips in
+    /// ~1s; anything past this means a stuck child, which we kill so the app's
+    /// state machine can never wedge permanently in `.transcribing`.
+    private static let timeout: TimeInterval = 120
+
     private static func transcribeSync(fileURL: URL, config: AppConfig) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: config.whisperBinaryPath)
-        process.arguments = [
+
+        var arguments = [
             "-m", config.modelPath,
             "-f", fileURL.path,
             "--language", config.language,
@@ -833,6 +897,14 @@ private enum WhisperTranscriber {
             "--no-timestamps",
             "--no-prints"
         ]
+        // Voice Activity Detection strips silence/noise before the encoder — the
+        // most effective fix for hallucinated captions on quiet/empty clips
+        // (push-to-talk users often pause before speaking). Only added if the
+        // VAD model is actually present, so a missing model degrades gracefully.
+        if config.enableVAD, FileManager.default.fileExists(atPath: config.vadModelPath) {
+            arguments += ["--vad", "--vad-model", config.vadModelPath, "--vad-speech-pad-ms", "200"]
+        }
+        process.arguments = arguments
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -842,12 +914,11 @@ private enum WhisperTranscriber {
             "GGML_METAL_PATH_RESOURCES": "/opt/homebrew/lib"
         ]) { current, _ in current }
 
-        try process.run()
-        process.waitUntilExit()
+        let (output, errorOutput, timedOut) = try runWithTimeout(process, stdout: stdout, stderr: stderr)
 
-        let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let errorOutput = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-
+        if timedOut {
+            throw AppError.whisperFailed("辨識逾時（超過 \(Int(timeout)) 秒），已中止。請確認模型與音檔正常。")
+        }
         guard process.terminationStatus == 0 else {
             let message = errorOutput.isEmpty ? output : errorOutput
             throw AppError.whisperFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -865,6 +936,51 @@ private enum WhisperTranscriber {
         }
 
         return text
+    }
+
+    /// Runs `process`, draining stdout/stderr concurrently (so a full pipe
+    /// buffer can never block exit) and enforcing a wall-clock timeout. On
+    /// timeout the child is terminated, then SIGKILLed if it ignores that.
+    private static func runWithTimeout(
+        _ process: Process,
+        stdout: Pipe,
+        stderr: Pipe
+    ) throws -> (output: String, error: String, timedOut: Bool) {
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        try process.run()
+
+        var outData = Data()
+        var errData = Data()
+        let ioGroup = DispatchGroup()
+        let ioQueue = DispatchQueue(label: "app.saykey.whisper.io", attributes: .concurrent)
+        ioGroup.enter()
+        ioQueue.async {
+            outData = stdout.fileHandleForReading.readDataToEndOfFile()
+            ioGroup.leave()
+        }
+        ioGroup.enter()
+        ioQueue.async {
+            errData = stderr.fileHandleForReading.readDataToEndOfFile()
+            ioGroup.leave()
+        }
+
+        var timedOut = false
+        if exited.wait(timeout: .now() + timeout) == .timedOut {
+            timedOut = true
+            process.terminate()
+            if exited.wait(timeout: .now() + 3) == .timedOut, process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+                exited.wait()
+            }
+        }
+
+        ioGroup.wait()
+        return (
+            String(data: outData, encoding: .utf8) ?? "",
+            String(data: errData, encoding: .utf8) ?? "",
+            timedOut
+        )
     }
 }
 
@@ -893,8 +1009,14 @@ private enum TraditionalConverter {
 
         do {
             try process.run()
-            stdin.fileHandleForWriting.write(Data(text.utf8))
-            stdin.fileHandleForWriting.closeFile()
+            // Write stdin on a background queue while we drain stdout on this
+            // one. Doing both inline would deadlock on long transcripts once
+            // OpenCC fills its stdout pipe buffer before we start reading.
+            let inputData = Data(text.utf8)
+            DispatchQueue.global(qos: .userInitiated).async {
+                stdin.fileHandleForWriting.write(inputData)
+                stdin.fileHandleForWriting.closeFile()
+            }
             let outData = stdout.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
 
@@ -956,6 +1078,73 @@ private func replaceCaseInsensitive(_ text: String, from: String, to: String) ->
 private func fourCharacterCode(_ string: String) -> OSType {
     string.utf8.reduce(0) { result, byte in
         (result << 8) + OSType(byte)
+    }
+}
+
+/// A small borderless floating pill near the bottom of the screen that tells the
+/// user, in their line of sight, whether SayKey is recording or transcribing —
+/// the menu-bar tint alone is too easy to miss for a push-to-talk tool.
+private final class RecordingHUD {
+    private var panel: NSPanel?
+    private let label = NSTextField(labelWithString: "")
+
+    func show(_ text: String) {
+        DispatchQueue.main.async { self.present(text) }
+    }
+
+    func hide() {
+        DispatchQueue.main.async { self.panel?.orderOut(nil) }
+    }
+
+    private func present(_ text: String) {
+        let panel = self.panel ?? makePanel()
+        self.panel = panel
+
+        label.stringValue = text
+        label.sizeToFit()
+        let width = max(180, label.frame.width + 48)
+        let height: CGFloat = 46
+
+        if let screen = NSScreen.main {
+            let x = screen.frame.midX - width / 2
+            let y = screen.frame.minY + 150
+            panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
+        }
+        label.frame = NSRect(x: 24, y: (height - 22) / 2, width: width - 48, height: 22)
+        panel.orderFrontRegardless()
+    }
+
+    private func makePanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 46),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+
+        let container = NSView(frame: panel.contentView?.bounds ?? .zero)
+        container.autoresizingMask = [.width, .height]
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 14
+        container.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.82).cgColor
+
+        label.font = .systemFont(ofSize: 15, weight: .medium)
+        label.textColor = .white
+        label.alignment = .center
+        label.isBezeled = false
+        label.drawsBackground = false
+        label.isEditable = false
+        label.isSelectable = false
+        container.addSubview(label)
+
+        panel.contentView = container
+        return panel
     }
 }
 
