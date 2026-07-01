@@ -44,6 +44,67 @@ private let defaultTermReplacements: [String: String] = [
     "p ninety nine": "p99"
 ]
 
+// User-facing key names → Carbon virtual key code + display glyph, for the
+// configurable global hotkey.
+private let hotKeyNameMap: [String: (code: Int, display: String)] = [
+    "space": (kVK_Space, "Space"),
+    "return": (kVK_Return, "Return"), "enter": (kVK_Return, "Return"),
+    "tab": (kVK_Tab, "Tab"),
+    "a": (kVK_ANSI_A, "A"), "b": (kVK_ANSI_B, "B"), "c": (kVK_ANSI_C, "C"),
+    "d": (kVK_ANSI_D, "D"), "e": (kVK_ANSI_E, "E"), "f": (kVK_ANSI_F, "F"),
+    "g": (kVK_ANSI_G, "G"), "h": (kVK_ANSI_H, "H"), "i": (kVK_ANSI_I, "I"),
+    "j": (kVK_ANSI_J, "J"), "k": (kVK_ANSI_K, "K"), "l": (kVK_ANSI_L, "L"),
+    "m": (kVK_ANSI_M, "M"), "n": (kVK_ANSI_N, "N"), "o": (kVK_ANSI_O, "O"),
+    "p": (kVK_ANSI_P, "P"), "q": (kVK_ANSI_Q, "Q"), "r": (kVK_ANSI_R, "R"),
+    "s": (kVK_ANSI_S, "S"), "t": (kVK_ANSI_T, "T"), "u": (kVK_ANSI_U, "U"),
+    "v": (kVK_ANSI_V, "V"), "w": (kVK_ANSI_W, "W"), "x": (kVK_ANSI_X, "X"),
+    "y": (kVK_ANSI_Y, "Y"), "z": (kVK_ANSI_Z, "Z"),
+    "0": (kVK_ANSI_0, "0"), "1": (kVK_ANSI_1, "1"), "2": (kVK_ANSI_2, "2"),
+    "3": (kVK_ANSI_3, "3"), "4": (kVK_ANSI_4, "4"), "5": (kVK_ANSI_5, "5"),
+    "6": (kVK_ANSI_6, "6"), "7": (kVK_ANSI_7, "7"), "8": (kVK_ANSI_8, "8"),
+    "9": (kVK_ANSI_9, "9")
+]
+
+private let defaultHotKeyCode = UInt32(kVK_Space)
+private let defaultHotKeyModifiers = UInt32(controlKey | optionKey)
+private let defaultHotKeyDisplay = "⌃⌥Space"
+
+/// Parses a string like "control-option-space" / "cmd+shift+d" into a Carbon key
+/// code + modifier mask + a display glyph (e.g. "⌃⌥Space"). Requires at least one
+/// modifier (a bare global hotkey would be a terrible idea). Returns nil on any
+/// unknown token so the caller can fall back to the default.
+private func parseHotKey(_ raw: String) -> (code: UInt32, modifiers: UInt32, display: String)? {
+    let tokens = raw.lowercased()
+        .split(whereSeparator: { "+- ".contains($0) })
+        .map(String.init)
+    guard !tokens.isEmpty else { return nil }
+
+    var modifiers: UInt32 = 0
+    var keyCode: UInt32?
+    var keyDisplay = ""
+    for token in tokens {
+        switch token {
+        case "control", "ctrl", "⌃": modifiers |= UInt32(controlKey)
+        case "option", "opt", "alt", "⌥": modifiers |= UInt32(optionKey)
+        case "command", "cmd", "⌘": modifiers |= UInt32(cmdKey)
+        case "shift", "⇧": modifiers |= UInt32(shiftKey)
+        default:
+            guard let mapped = hotKeyNameMap[token] else { return nil }
+            keyCode = UInt32(mapped.code)
+            keyDisplay = mapped.display
+        }
+    }
+    guard let code = keyCode, modifiers != 0 else { return nil }
+
+    var display = ""
+    if modifiers & UInt32(controlKey) != 0 { display += "⌃" }
+    if modifiers & UInt32(optionKey) != 0 { display += "⌥" }
+    if modifiers & UInt32(shiftKey) != 0 { display += "⇧" }
+    if modifiers & UInt32(cmdKey) != 0 { display += "⌘" }
+    display += keyDisplay
+    return (code, modifiers, display)
+}
+
 private struct FileConfig: Decodable {
     let whisperBinaryPath: String?
     let modelPath: String?
@@ -75,6 +136,10 @@ private struct FileConfig: Decodable {
     let useServer: Bool?
     let whisperServerBinaryPath: String?
 
+    // Global hotkey, e.g. "control-option-space" or "cmd-shift-d". Needs an app
+    // restart to take effect.
+    let hotkey: String?
+
     // Older Apple Speech config keys are tolerated so existing files do not fail.
     let localeIdentifier: String?
     let requiresOnDeviceRecognition: Bool?
@@ -95,6 +160,9 @@ private struct AppConfig {
     let soundFeedback: Bool
     let useServer: Bool
     let whisperServerBinaryPath: String
+    let hotKeyCode: UInt32
+    let hotKeyModifiers: UInt32
+    let hotKeyDisplay: String
 
     static let configDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".saykey", isDirectory: true)
@@ -197,6 +265,9 @@ private struct AppConfig {
             fileConfig?.whisperServerBinaryPath
         ) ?? "/opt/homebrew/bin/whisper-server"
 
+        let parsedHotKey = firstNonEmpty(env["SAYKEY_HOTKEY"], fileConfig?.hotkey)
+            .flatMap(parseHotKey)
+
         return AppConfig(
             whisperBinaryPath: NSString(string: whisperBinaryPath).expandingTildeInPath,
             modelPath: NSString(string: modelPath).expandingTildeInPath,
@@ -211,7 +282,10 @@ private struct AppConfig {
             vadModelPath: NSString(string: vadModelPath).expandingTildeInPath,
             soundFeedback: soundFeedback,
             useServer: useServer,
-            whisperServerBinaryPath: NSString(string: whisperServerBinaryPath).expandingTildeInPath
+            whisperServerBinaryPath: NSString(string: whisperServerBinaryPath).expandingTildeInPath,
+            hotKeyCode: parsedHotKey?.code ?? defaultHotKeyCode,
+            hotKeyModifiers: parsedHotKey?.modifiers ?? defaultHotKeyModifiers,
+            hotKeyDisplay: parsedHotKey?.display ?? defaultHotKeyDisplay
         )
     }
 
@@ -232,6 +306,7 @@ private struct AppConfig {
               "enableVAD": true,
               "soundFeedback": true,
               "useServer": true,
+              "hotkey": "control-option-space",
               "contextualTerms": [
                 "SRE",
                 "AWS",
@@ -356,21 +431,32 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
     private var eventHandlerRef: EventHandlerRef?
     private var hasShownAccessibilityHint = false
     private var lastTranscript: String?
+    private var hotKeyDisplay = defaultHotKeyDisplay
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+
+        // Load once so the menu labels + hotkey + warm server all use the same
+        // config. Changing the hotkey needs an app restart (Carbon registers it
+        // once).
+        let config = try? AppConfig.load()
+        if let config { hotKeyDisplay = config.hotKeyDisplay }
+
         configureMenu()
         updateStatus(title: "Ready")
         requestMicrophonePermissionIfNeeded()
 
         // Warm the whisper server so the first (and every) utterance skips the
         // ~300ms model reload. Safe if it fails — transcription falls back to CLI.
-        if let config = try? AppConfig.load() {
+        if let config {
             WhisperServerManager.shared.startIfNeeded(config: config)
         }
 
         do {
-            try registerHotKey()
+            try registerHotKey(
+                code: config?.hotKeyCode ?? defaultHotKeyCode,
+                modifiers: config?.hotKeyModifiers ?? defaultHotKeyModifiers
+            )
         } catch {
             showError(error)
         }
@@ -463,7 +549,7 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
             }
         }
 
-        toggleMenuItem.title = "Start Recording (Control-Option-Space)"
+        toggleMenuItem.title = "開始錄音（\(hotKeyDisplay)）"
         toggleMenuItem.target = self
         toggleMenuItem.action = #selector(toggleRecordingFromMenu)
         menu.addItem(toggleMenuItem)
@@ -509,7 +595,7 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    private func registerHotKey() throws {
+    private func registerHotKey(code: UInt32, modifiers: UInt32) throws {
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
@@ -555,9 +641,8 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
         }
 
         let hotKeyID = EventHotKeyID(signature: fourCharacterCode("SKEY"), id: 1)
-        let modifiers = UInt32(controlKey | optionKey)
         let status = RegisterEventHotKey(
-            UInt32(kVK_Space),
+            code,
             modifiers,
             hotKeyID,
             GetApplicationEventTarget(),
@@ -813,15 +898,15 @@ private final class SayKeyApp: NSObject, NSApplicationDelegate {
     private func updateStatus(title: String) {
         switch state {
         case .idle:
-            toggleMenuItem.title = "開始錄音（Control-Option-Space）"
+            toggleMenuItem.title = "開始錄音（\(hotKeyDisplay)）"
             statusItem.button?.contentTintColor = nil
             setStatusIcon("mic")
             hud.hide()
         case .recording:
-            toggleMenuItem.title = "停止並辨識（Control-Option-Space）"
+            toggleMenuItem.title = "停止並辨識（\(hotKeyDisplay)）"
             statusItem.button?.contentTintColor = .systemRed
             setStatusIcon("mic.fill")
-            hud.show("🔴 錄音中… 再按一次快捷鍵停止")
+            hud.show("🔴 錄音中… 再按一次 \(hotKeyDisplay) 停止")
         case .transcribing:
             toggleMenuItem.title = "辨識中…"
             statusItem.button?.contentTintColor = .systemBlue
