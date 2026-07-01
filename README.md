@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/saykey-social.png" alt="SayKey" width="640">
+
 # SayKey
 
 **按鍵說話，文字就落在游標處。**
