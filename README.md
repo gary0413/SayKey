@@ -26,6 +26,14 @@ English 技術詞拼寫正確。
 - 🧠 **聽得懂你的術語** — 內建 SRE / DevOps 詞庫（kubectl、Terraform、PagerDuty、5xx、p95…），還能自訂專屬的「常錯字」修正表。
 - ⚡ **不擋路** — 一個選單列麥克風圖示、閒置時 ~0% CPU、全域快捷鍵、沒有 Dock 圖示、不用註冊帳號。
 
+## 拿來對 AI coding agent 講話（vibe coding）
+
+用 Cursor、Claude Code 這類 AI coding agent 時，最花力氣的往往不是 AI 寫 code，而是**把需求講清楚**。SayKey 補的就是這段：按下快捷鍵，用最自然的**中英混講**把需求、context、要改哪個檔案講出來，它幫你整理成拼字正確的**繁體中文 prompt**（`kubectl`、`p95`、`Terraform` 這些術語不會被聽爛），再貼進 agent 的輸入框。
+
+這裡是**批次**的、剛好夠用：講一段需求 → 看一眼 → 送出，本來就不需要即時串流。而且因為**全程在你的 Mac 上跑、離線、不接任何雲端 API**，就算你在 prompt 裡貼公司內部的服務名、架構、專有 code context，聲音和文字都不會離開這台機器——這正是「要把私有 code 情境餵給 AI」時最在意的地方。
+
+> 講白：**SayKey 不會幫你「用嘴寫 code」，也不產生程式碼。** 寫 code 的是你的 AI agent；SayKey 只負責把你腦袋裡的中英混講需求，變成一段乾淨、可直接貼上的繁中 prompt。
+
 ## 運作流程
 
 ```
@@ -87,6 +95,8 @@ open dist/SayKey.app
 （原理見 [程式碼簽章](#程式碼簽章為什麼授權不會失效)）。
 
 ## 設定
+
+**多數人不用改，裝好預設就能用。** 下面是想微調時的完整參考。
 
 設定檔位於 `~/.saykey/config.json`（選單 → **Open Config…** 會建立範本）：
 
